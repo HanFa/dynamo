@@ -1374,6 +1374,9 @@ async def test_prefill_caps_client_min_tokens_before_building_sampling_params(
     handler.model_max_len = 128
     handler.config = SimpleNamespace(enable_rl=False)
     handler.engine_client = SimpleNamespace(vllm_config=None)
+    handler._multimodal_request_processor.kv_handoff = SimpleNamespace(
+        prepare=AsyncMock(return_value=({}, None))
+    )
     monkeypatch.setattr(
         mod,
         "make_kv_connector_protocol",
@@ -1441,6 +1444,11 @@ async def test_prefill_emits_attempt_cache_reuse(monkeypatch, cached_tokens, n):
             )
         ),
         build_prefill_handoff=MagicMock(return_value=None),
+        kv_handoff=SimpleNamespace(
+            prepare=AsyncMock(
+                return_value=({"prompt_token_ids": request["token_ids"]}, None)
+            )
+        ),
     )
     handler._build_prompt_from_request = MagicMock(
         return_value={"prompt_token_ids": request["token_ids"]}

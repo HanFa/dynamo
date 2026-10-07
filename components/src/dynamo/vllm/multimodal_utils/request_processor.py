@@ -39,6 +39,8 @@ from dynamo.common.multimodal.mm_kwargs_transfer import (
 from dynamo.common.multimodal.video_loader import VideoLoader
 from dynamo.common.utils import nvtx_utils as _nvtx
 from dynamo.llm.exceptions import InvalidArgument
+from dynamo.vllm import envs
+from dynamo.vllm.kv_handoff import MultimodalKvHandoff
 
 from .hash_utils import compute_mm_uuids_from_images
 from .model import ModelFamily, construct_qwen_decode_mm_data, resolve_model_family
@@ -319,6 +321,9 @@ class VllmMultimodalRequestProcessor:
     ) -> None:
         self.model = model
         self.engine_client = engine_client
+        self.kv_handoff = MultimodalKvHandoff(
+            engine_client, enabled=envs.DYN_VLLM_MULTIMODAL_KV_HANDOFF
+        )
         self.enable_multimodal = enable_multimodal
         self.enable_frontend_decoding = enable_frontend_decoding
         self.trust_remote_code = trust_remote_code
@@ -574,9 +579,11 @@ class VllmMultimodalRequestProcessor:
                         # Keep UUID-only slots as bare None so cache misses fail
                         # before model-specific vision processing.
                         chunks = [
-                            None
-                            if image is None
-                            else {"type": "image", "image": image, "uuid": None}
+                            (
+                                None
+                                if image is None
+                                else {"type": "image", "image": image, "uuid": None}
+                            )
                             for image in images
                         ]
                         vllm_mm_data[image_key] = (
@@ -845,6 +852,17 @@ class VllmMultimodalRequestProcessor:
         pre_rendered = None
 
         if mode == DisaggregationMode.DECODE:
+            try:
+                pre_rendered = self.kv_handoff.restore(request)
+            except ValueError as exc:
+                raise MissingMultimodalHandoffError(str(exc)) from exc
+            if pre_rendered is not None:
+                return PreparedMultimodalInput(
+                    request=request_for_prompt,
+                    multi_modal_data=None,
+                    mm_processor_kwargs=None,
+                    pre_rendered_prompt=pre_rendered,
+                )
             prefill_result = request.get("prefill_result") or {}
             disaggregated_params = prefill_result.get("disaggregated_params") or {}
             embedding_params = disaggregated_params.get("embedding_params") or None

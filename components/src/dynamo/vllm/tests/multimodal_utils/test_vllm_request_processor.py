@@ -66,6 +66,36 @@ async def _prepare_prompt(processor, request, request_id, context, mode):
 
 
 @pytest.mark.asyncio
+async def test_external_kv_handoff_bypasses_all_decode_media_loading():
+    processor = _processor(model="llava-hf/llava-1.5-7b-hf")
+    prompt = {"type": "multimodal", "prompt_token_ids": [1, 99, 99, 2]}
+    processor.kv_handoff = SimpleNamespace(restore=MagicMock(return_value=prompt))
+    request = {
+        "token_ids": [1, 99, 2],
+        "multi_modal_data": {"image_url": [{"Url": "https://example.com/a.png"}]},
+    }
+    prepared = await processor.prepare_input(
+        request, "request-a", None, DisaggregationMode.DECODE
+    )
+    assert prepared.pre_rendered_prompt is prompt
+    assert prepared.multi_modal_data is None
+    processor.image_loader.load_image_batch.assert_not_awaited()
+    processor.video_loader.load_video_batch.assert_not_awaited()
+    processor.audio_loader.load_audio_batch.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_invalid_external_kv_handoff_is_a_request_error_before_media_load():
+    processor = _processor(model="llava-hf/llava-1.5-7b-hf")
+    processor.kv_handoff = SimpleNamespace(
+        restore=MagicMock(side_effect=ValueError("KV mismatch"))
+    )
+    with pytest.raises(mod.MissingMultimodalHandoffError, match="KV mismatch"):
+        await processor.prepare_input({}, "request-a", None, DisaggregationMode.DECODE)
+    processor.image_loader.load_image_batch.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_extracts_mixed_url_data_url_and_decoded_media():
     processor = _processor()
     image = Image.new("RGB", (1, 1))

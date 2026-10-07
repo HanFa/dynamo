@@ -21,6 +21,7 @@ DEFAULT_FORWARDPASS_METRIC_PORT = 20380
 
 if TYPE_CHECKING:
     DYN_FORWARDPASS_METRIC_PORT: int = DEFAULT_FORWARDPASS_METRIC_PORT
+    DYN_VLLM_MULTIMODAL_KV_HANDOFF: bool = False
 
 
 def _resolve_port(env_var: str, default_port: int) -> int:
@@ -59,6 +60,10 @@ def _resolve_port(env_var: str, default_port: int) -> int:
 
 # Environment variables configuration
 environment_variables: dict[str, Callable[[], Any]] = {
+    "DYN_VLLM_MULTIMODAL_KV_HANDOFF": lambda: os.getenv(
+        "DYN_VLLM_MULTIMODAL_KV_HANDOFF", "0"
+    )
+    == "1",
     "DYN_FORWARDPASS_METRIC_PORT": lambda: _resolve_port(
         "DYN_FORWARDPASS_METRIC_PORT", DEFAULT_FORWARDPASS_METRIC_PORT
     ),

@@ -910,9 +910,11 @@ def build_sampling_params(
         sampling_params.prompt_logprobs = prompt_logprobs
         explicit_cache_setting = sampling_options.get(
             "skip_reading_prefix_cache",
-            extra_args.get("skip_reading_prefix_cache")
-            if isinstance(extra_args, dict)
-            else None,
+            (
+                extra_args.get("skip_reading_prefix_cache")
+                if isinstance(extra_args, dict)
+                else None
+            ),
         )
         sampling_params.skip_reading_prefix_cache = (
             True if explicit_cache_setting is None else explicit_cache_setting
@@ -4330,6 +4332,11 @@ class PrefillWorkerHandler(BaseWorkerHandler):
             enable_rl=self.config.enable_rl,
         )
 
+        (
+            prompt,
+            pending_mm_handoff,
+        ) = await self._multimodal_request_processor.kv_handoff.prepare(request, prompt)
+
         # One protocol instance per request; carries per-request state
         # (e.g. Mooncake's transfer_id) into the response loop below.
         kv_protocol: KvConnectorProtocol = make_kv_connector_protocol(
@@ -4404,10 +4411,19 @@ class PrefillWorkerHandler(BaseWorkerHandler):
                     )
                 )
 
+                kv_transfer_params = kv_protocol.decode_request_kv_transfer_params(res)
+                if pending_mm_handoff is not None and kv_transfer_params is not None:
+                    embedding_params = {
+                        **(embedding_params or {}),
+                        "multimodal_kv_handoff": pending_mm_handoff.bind(
+                            kv_transfer_params
+                        ),
+                    }
+
                 output: Dict[str, Any] = {
                     "token_ids": list(token_ids),
                     "disaggregated_params": self._build_disaggregated_params(
-                        kv_protocol.decode_request_kv_transfer_params(res),
+                        kv_transfer_params,
                         embedding_params,
                     ),
                     "completion_usage": BaseWorkerHandler._build_completion_usage(
