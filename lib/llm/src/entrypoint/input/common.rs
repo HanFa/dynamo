@@ -344,6 +344,7 @@ pub async fn prepare_engine(
             if !local_model.path().as_os_str().is_empty() {
                 watcher.set_local_model_path(Some(local_model.path().to_path_buf()));
             }
+            watcher.set_frontend_image_fetch(local_model.frontend_image_fetch());
             watcher.set_tokenizer_backend(local_model.runtime_config().tokenizer_backend);
             watcher.set_tokenizer_fallback_enabled(
                 local_model.runtime_config().tokenizer_fallback_enabled,

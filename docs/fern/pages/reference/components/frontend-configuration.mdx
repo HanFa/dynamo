@@ -95,6 +95,63 @@ The Rust HTTP server also reads these environment variables, which are not expos
   Unset, `0`, invalid, or unrepresentable values disable keep-alive comments.
 </ParamField>
 
+## Frontend image fetching
+
+<ParamField path="--frontend-image-fetch" type="boolean" default="false">
+  Prefetch HTTP(S) images asynchronously in the Rust chat preprocessor. vLLM
+  workers request the encoded bytes only when their local URL image cache misses.
+  Requires `--dyn-chat-processor dynamo`. Use `--no-frontend-image-fetch` to
+  override an enabled environment setting.
+
+  Environment variable: `DYN_FRONTEND_IMAGE_FETCH`
+</ParamField>
+
+```bash
+python -m dynamo.frontend --frontend-image-fetch
+```
+
+This option supports JPEG, PNG, GIF, and WebP images. It preserves image order,
+explicit UUIDs, and the original URL identity used by multimodal routing. Repeated
+URLs share one download within a request. Existing inline images, audio, video,
+and frontend decoding through NIXL retain their existing processing paths.
+
+The frontend sends the original URLs and optional request-scoped fetch references
+instead of embedding image bytes in the inference request. Updated vLLM workers
+check their existing local URL cache first. A hit proceeds without waiting for
+prefetch. A miss retrieves the prefetched bytes over Dynamo's internal request
+plane, decodes them, and populates the existing cache. Prefill and decode workers
+share the frontend download. Cache eviction, concurrent-load deduplication, and
+session scoping retain their existing behavior. Older workers ignore the optional
+references and use their ordinary URL loader; they remain compatible but do not
+benefit from the shared download.
+
+Workers must be able to reach the frontend through the configured Dynamo request
+plane. No additional HTTP service or public route is required. Multimodal routing
+also reuses prefetched bytes when its dimension cache misses; a dimension-cache
+hit does not wait for the download.
+
+Downloads use the existing media URL, DNS, and redirect policy, including
+`DYN_MM_ALLOW_INTERNAL`, and connect directly without HTTP proxy environment
+variables. Each model preprocessor allows four concurrent downloads. Each fetch,
+including waiting for a download slot, has a 30-second deadline. Request completion
+or cancellation removes its references and cancels outstanding downloads.
+
+Each fetched image must fit `DYN_MM_MAX_DATA_URL_MB` after base64 encoding
+(16 MiB by default, including the data URL prefix). Unique fetched images and
+existing inline images share a 16 MiB request budget. Encoded buffers are bounded
+at 64 MiB per model preprocessor, with at most 1024 pending image references per
+frontend namespace. Downloads that exceed these limits fail when consumed. A worker
+cache hit can still succeed if its speculative download fails. The request plane
+also applies its configured frame-size limit to each image response.
+
+<Note>
+  There is no cross-request frontend image cache. Speculative downloads can still
+  consume frontend ingress bandwidth and encoding CPU when both workers hit their
+  caches. Cache hits avoid image payload transfer from frontend to worker. Benchmark
+  frontend ingress and egress as well as cold and warm request latency before
+  enabling this option. Workers still perform processing outside their image cache.
+</Note>
+
 ## Router
 
 This section is the canonical CLI and environment-variable reference for the frontend's embedded

@@ -1279,6 +1279,7 @@ class BaseWorkerHandler(ABC, Generic[RequestT, ResponseT]):
 
         self._multimodal_request_processor = VllmMultimodalRequestProcessor(
             model=config.model_source_path,
+            runtime=runtime,
             engine_client=engine,
             enable_multimodal=enable_multimodal,
             enable_frontend_decoding=enable_frontend_decoding,

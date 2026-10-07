@@ -91,6 +91,7 @@ class FrontendConfig(RouterConfigBase, KvRouterConfigBase, AisPerfConfigBase):
     response_plane: str = "tcp"
     event_plane: Optional[str] = None
     chat_processor: str
+    frontend_image_fetch: bool = False
     enable_anthropic_api: bool
     strip_anthropic_preamble: bool
     debug_perf: bool
@@ -107,6 +108,10 @@ class FrontendConfig(RouterConfigBase, KvRouterConfigBase, AisPerfConfigBase):
     _VALID_TOKENIZER_BACKENDS = {"default", "fastokens", "basetenkenizer"}
 
     def validate(self) -> None:
+        if self.frontend_image_fetch and self.chat_processor != "dynamo":
+            raise ValueError(
+                "--frontend-image-fetch requires --dyn-chat-processor dynamo"
+            )
         if self.load_aware:
             self.router_mode = "kv"
         self.apply_router_config()
@@ -632,6 +637,19 @@ class FrontendArgGroup(ArgGroup):
                 "parsing, and reasoning parsing."
             ),
             choices=["dynamo", "vllm", "sglang"],
+        )
+
+        add_negatable_bool_argument(
+            g,
+            flag_name="--frontend-image-fetch",
+            env_var="DYN_FRONTEND_IMAGE_FETCH",
+            default=False,
+            dest="frontend_image_fetch",
+            help=(
+                "Prefetch HTTP(S) images once per request in the Rust frontend and serve "
+                "encoded bytes on worker cache misses. Requires --dyn-chat-processor dynamo. "
+                "Does not affect frontend media decoding, audio, or video."
+            ),
         )
 
         add_negatable_bool_argument(

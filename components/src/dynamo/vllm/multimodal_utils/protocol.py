@@ -197,6 +197,9 @@ class vLLMMultimodalRequest(vLLMGenerateRequest):
     # Opaque frontend-derived scope for encoded/decoded image caches.
     image_cache_scope: Optional[str] = None
 
+    # Request-scoped frontend fetch references aligned with original image URLs.
+    image_fetches: Optional[list[Optional[dict[str, str]]]] = None
+
 
 class MyRequestOutput(BaseModel):
     """

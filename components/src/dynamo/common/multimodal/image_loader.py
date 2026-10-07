@@ -8,7 +8,7 @@ import hashlib
 import logging
 import os
 from collections import OrderedDict
-from collections.abc import Mapping
+from collections.abc import Awaitable, Callable, Mapping
 from io import BytesIO
 from typing import Any, Coroutine, Dict, Final, List, Literal, overload
 from urllib.parse import urlsplit
@@ -39,6 +39,8 @@ logger = logging.getLogger(__name__)
 URL_VARIANT_KEY: Final = "Url"
 DECODED_VARIANT_KEY: Final = "Decoded"
 UUID_ONLY_VARIANT_KEY: Final = "UuidOnly"
+ImageFetch = Callable[[], Awaitable[str]]
+
 IMAGE_CACHE_SCOPE_KEY: Final = "image_cache_scope"
 IMAGE_CACHE_SESSION_SCOPED_ENV: Final = "DYN_MM_IMAGE_CACHE_SESSION_SCOPED"
 
@@ -249,8 +251,10 @@ class ImageLoader:
                 self._image_cache.popitem(last=False)
             self._image_cache[key] = image
 
-    async def _fetch_and_process(self, key: str | None, image_url: str) -> Image.Image:
-        """Fetch image via HTTP(S), decode with PIL, return RGB Image.
+    async def _fetch_and_process(
+        self, key: str | None, image_url: str, fetch_image: ImageFetch | None = None
+    ) -> Image.Image:
+        """Decode inline bytes or fetch via HTTP(S), returning an RGB image.
 
         Checks the optional shared encoded-image cache before hitting the
         origin and refills it after a successful origin fetch. A ``None`` key
@@ -258,6 +262,9 @@ class ImageLoader:
         All exception normalization happens here so shared callers see
         identical error types.
         """
+        if fetch_image is not None:
+            return await self._decode_data_url(await fetch_image())
+
         try:
             if self._shared_image_cache is not None and key is not None:
                 cached_content = await self._shared_image_cache.get(key)
@@ -302,8 +309,7 @@ class ImageLoader:
             )
             raise HttpStatusError(
                 408,
-                f"Timeout loading image: '{image_url}' "
-                f"(timeout={self._http_timeout}s)",
+                f"Timeout loading image: '{image_url}' (timeout={self._http_timeout}s)",
                 image_url,
             ) from e
         except HttpConnectionError as e:
@@ -336,10 +342,16 @@ class ImageLoader:
             logger.error(f"{type(e).__name__} loading image: '{image_url}': {e}")
             raise
 
-    async def _fetch_and_cache(self, key: str, image_url: str) -> Image.Image:
+    async def _fetch_and_cache(
+        self, key: str, image_url: str, fetch_image: ImageFetch | None = None
+    ) -> Image.Image:
         """Shared task: fetch, cache, then remove from _inflight."""
         try:
-            image = await self._fetch_and_process(key, image_url)
+            image = (
+                await self._fetch_and_process(key, image_url, fetch_image)
+                if fetch_image is not None
+                else await self._fetch_and_process(key, image_url)
+            )
             self._cache_put(key, image)
             return image
         finally:
@@ -358,9 +370,17 @@ class ImageLoader:
 
     @_nvtx.annotate("mm:img:load_image", color="lime")
     async def load_image(
-        self, image_url: str, *, cache_scope: str | None = None
+        self,
+        image_url: str,
+        *,
+        cache_scope: str | None = None,
+        fetch_image: ImageFetch | None = None,
     ) -> Image.Image:
-        """Load and decode one media URL through the validated image cache."""
+        """Load by URL, requesting frontend bytes only on a local cache miss.
+
+        The optional callback joins the frontend's request-scoped prefetch. Cache
+        hits and in-flight deduplication never invoke it or wait for its result.
+        """
 
         parsed_url = urlsplit(image_url)
         if parsed_url.scheme in ("", "file"):
@@ -370,19 +390,28 @@ class ImageLoader:
         normalized_url = await validate_media_url(image_url, self._url_policy)
         parsed_url = urlsplit(normalized_url)
 
+        if fetch_image is not None and parsed_url.scheme not in ("http", "https"):
+            raise ValueError("Frontend image fetching requires an HTTP(S) image URL")
+
         if parsed_url.scheme in ("http", "https"):
             key = self._cache_key(normalized_url, cache_scope)
 
             if key is None:
-                return await self._fetch_and_process(None, normalized_url)
+                return (
+                    await self._fetch_and_process(None, normalized_url, fetch_image)
+                    if fetch_image is not None
+                    else await self._fetch_and_process(None, normalized_url)
+                )
 
             if key in self._image_cache:
-                logger.debug(f"Image found in cache for URL: {image_url}")
+                logger.debug("Image found in cache for URL: %s", normalized_url)
                 self._image_cache.move_to_end(key)
                 return self._image_cache[key]
 
             if key not in self._inflight:
-                task = asyncio.create_task(self._fetch_and_cache(key, normalized_url))
+                task = asyncio.create_task(
+                    self._fetch_and_cache(key, normalized_url, fetch_image)
+                )
                 # Suppress "exception was never retrieved" if all waiters cancel
                 task.add_done_callback(
                     lambda t: t.exception() if not t.cancelled() else None
@@ -392,43 +421,44 @@ class ImageLoader:
             return await asyncio.shield(self._inflight[key])
 
         if parsed_url.scheme == "data":
-            try:
-                with _nvtx.annotate("mm:img:base64_decode", color="lime"):
-                    if not parsed_url.path.startswith("image/"):
-                        raise ValueError("Data URL must be an image type")
+            return await self._decode_data_url(normalized_url)
 
-                    media_type, data = parsed_url.path.split(",", 1)
-                    if ";base64" not in media_type:
-                        raise ValueError("Data URL must be base64 encoded")
-
-                    try:
-                        image_bytes = base64.b64decode(data, validate=True)
-                    except binascii.Error as e:
-                        raise ValueError(f"Invalid base64 encoding: {e}") from e
-                    image_data = BytesIO(image_bytes)
-                return await self._open_image(image_data)
-            except Image.UnidentifiedImageError as e:
-                logger.error(f"Unsupported image format decoding: '{image_url}'")
-                raise HttpStatusError(415, "Unsupported Media Type", image_url) from e
-            except ValueError as e:
-                if "Unsupported image format" in str(e):
-                    logger.error(f"Unsupported image format decoding: '{image_url}'")
-                    raise HttpStatusError(
-                        415, "Unsupported Media Type", image_url
-                    ) from e
-                logger.error(f"{type(e).__name__} decoding image: '{image_url}': {e}")
-                raise ValueError(f"Failed to decoding image: '{image_url}': {e}") from e
-            except OSError as e:
-                logger.error(f"Invalid or truncated image data: '{image_url}'")
-                raise HttpStatusError(
-                    400, "Invalid or truncated image data", image_url
-                ) from e
-            except Exception:
-                logger.error(f"Unexpected error decoding image: '{image_url}'")
-                raise
-
-        # It's not file:, http:, https:, or data:
         raise ValueError(f"Invalid image source scheme: {parsed_url.scheme}")
+
+    async def _decode_data_url(self, image_url: str) -> Image.Image:
+        parsed_url = urlsplit(image_url)
+        try:
+            with _nvtx.annotate("mm:img:base64_decode", color="lime"):
+                if not parsed_url.path.startswith("image/"):
+                    raise ValueError("Data URL must be an image type")
+
+                media_type, data = parsed_url.path.split(",", 1)
+                if ";base64" not in media_type:
+                    raise ValueError("Data URL must be base64 encoded")
+
+                try:
+                    image_bytes = base64.b64decode(data, validate=True)
+                except binascii.Error as e:
+                    raise ValueError(f"Invalid base64 encoding: {e}") from e
+                image_data = BytesIO(image_bytes)
+            return await self._open_image(image_data)
+        except Image.UnidentifiedImageError as e:
+            logger.error("Unsupported inline image format")
+            raise HttpStatusError(415, "Unsupported Media Type", "data:") from e
+        except ValueError as e:
+            if "Unsupported image format" in str(e):
+                logger.error("Unsupported inline image format")
+                raise HttpStatusError(415, "Unsupported Media Type", "data:") from e
+            logger.error("Invalid inline image: %s", e)
+            raise ValueError(f"Failed to decode inline image: {e}") from e
+        except OSError as e:
+            logger.error("Invalid or truncated inline image")
+            raise HttpStatusError(
+                400, "Invalid or truncated image data", "data:"
+            ) from e
+        except Exception:
+            logger.error("Unexpected error decoding inline image")
+            raise
 
     @overload
     async def load_image_batch(
@@ -437,6 +467,7 @@ class ImageLoader:
         *,
         preserve_uuid_slots: Literal[False] = False,
         cache_scope: str | None = None,
+        image_fetches: list[ImageFetch | None] | None = None,
     ) -> list[Image.Image]:
         ...
 
@@ -447,6 +478,7 @@ class ImageLoader:
         *,
         preserve_uuid_slots: Literal[True],
         cache_scope: str | None = None,
+        image_fetches: list[ImageFetch | None] | None = None,
     ) -> list[Image.Image | None]:
         ...
 
@@ -456,6 +488,7 @@ class ImageLoader:
         *,
         preserve_uuid_slots: bool = False,
         cache_scope: str | None = None,
+        image_fetches: list[ImageFetch | None] | None = None,
     ) -> list[Any]:
         """
         Load a batch of images from multimodal data items.
@@ -472,6 +505,8 @@ class ImageLoader:
                 as None. This is enabled only by backends that resolve such slots.
             cache_scope: Stable session or request identifier used when
                 DYN_MM_IMAGE_CACHE_SESSION_SCOPED is enabled.
+            image_fetches: Optional callbacks aligned with HTTP(S) image slots.
+                Invoked only on a cache miss. Other slots must be None.
 
         Returns:
             Loaded images, with None for UUID-only cache slots
@@ -491,15 +526,32 @@ class ImageLoader:
             ValueError: If enable_frontend_decoding=True but nixl_connector is None
             ValueError: If a UUID-only slot is received without opting in
         """
+        if image_fetches is not None and (
+            len(image_fetches) != len(image_mm_items)
+            or any(fetch is not None and not callable(fetch) for fetch in image_fetches)
+        ):
+            raise ValueError("Frontend image fetches must align with image slots")
+        if image_fetches is not None and any(
+            fetch is not None
+            and (not isinstance(item, dict) or URL_VARIANT_KEY not in item)
+            for item, fetch in zip(image_mm_items, image_fetches, strict=True)
+        ):
+            raise ValueError("Frontend image fetching requires a URL image slot")
+
         image_futures: list[Coroutine[Any, Any, Image.Image]] = []
         slot_to_future_idx: list[int | None] = []
 
         for idx, item in enumerate(image_mm_items):
+            fetch_image = image_fetches[idx] if image_fetches is not None else None
             if isinstance(item, dict) and URL_VARIANT_KEY in item:
                 # URL path: download and decode in Python backend
                 url = item[URL_VARIANT_KEY]
                 slot_to_future_idx.append(len(image_futures))
-                image_futures.append(self.load_image(url, cache_scope=cache_scope))
+                image_futures.append(
+                    self.load_image(
+                        url, cache_scope=cache_scope, fetch_image=fetch_image
+                    )
+                )
                 logger.debug(f"Preparing to load image from URL: {url[:80]}...")
             elif isinstance(item, dict) and DECODED_VARIANT_KEY in item:
                 if self._enable_frontend_decoding:

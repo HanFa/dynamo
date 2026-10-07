@@ -23,6 +23,7 @@ from vllm.multimodal.inputs import MultiModalKwargsItem, PlaceholderRange
 
 from dynamo.common.constants import DisaggregationMode
 from dynamo.common.multimodal.audio_loader import AudioLoader
+from dynamo.common.multimodal.frontend_image_client import FrontendImageClient
 from dynamo.common.multimodal.image_loader import (
     URL_VARIANT_KEY,
     UUID_ONLY_VARIANT_KEY,
@@ -308,6 +309,7 @@ class VllmMultimodalRequestProcessor:
         *,
         model: str,
         engine_client: Any = None,
+        runtime: Any = None,
         enable_multimodal: bool = False,
         enable_frontend_decoding: bool = False,
         embedding_loader: Any = None,
@@ -319,6 +321,7 @@ class VllmMultimodalRequestProcessor:
     ) -> None:
         self.model = model
         self.engine_client = engine_client
+        self._frontend_images = FrontendImageClient(runtime)
         self.enable_multimodal = enable_multimodal
         self.enable_frontend_decoding = enable_frontend_decoding
         self.trust_remote_code = trust_remote_code
@@ -566,6 +569,9 @@ class VllmMultimodalRequestProcessor:
                         image_items,
                         cache_scope=image_cache_scope_from_request(request),
                         preserve_uuid_slots=True,
+                        image_fetches=self._frontend_images.callbacks(
+                            request.get("image_fetches"), context
+                        ),
                     )
                 if images:
                     if self.use_unified_vision_chunk:

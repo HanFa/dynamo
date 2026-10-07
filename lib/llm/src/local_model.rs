@@ -67,6 +67,7 @@ pub struct LocalModelBuilder {
     http_metrics_port: Option<u16>,
     metrics_config: MetricsConfig,
     frontend_api_config: FrontendApiConfig,
+    frontend_image_fetch: bool,
     tls_cert_path: Option<PathBuf>,
     tls_key_path: Option<PathBuf>,
     tls_client_ca_cert_path: Option<PathBuf>,
@@ -93,6 +94,7 @@ impl Default for LocalModelBuilder {
             http_metrics_port: None,
             metrics_config: Default::default(),
             frontend_api_config: Default::default(),
+            frontend_image_fetch: false,
             tls_cert_path: Default::default(),
             tls_key_path: Default::default(),
             tls_client_ca_cert_path: Default::default(),
@@ -177,6 +179,12 @@ impl LocalModelBuilder {
 
     pub fn metrics_config(&mut self, metrics_config: MetricsConfig) -> &mut Self {
         self.metrics_config = metrics_config;
+        self
+    }
+
+    /// Enable request-scoped encoded image fetching in the frontend.
+    pub fn frontend_image_fetch(&mut self, enabled: bool) -> &mut Self {
+        self.frontend_image_fetch = enabled;
         self
     }
 
@@ -370,6 +378,7 @@ impl LocalModelBuilder {
                 http_metrics_port: self.http_metrics_port,
                 metrics_config: self.metrics_config.clone(),
                 frontend_api_config: self.frontend_api_config.clone(),
+                frontend_image_fetch: self.frontend_image_fetch,
                 tls_cert_path: self.tls_cert_path.take(),
                 tls_key_path: self.tls_key_path.take(),
                 tls_client_ca_cert_path: self.tls_client_ca_cert_path.take(),
@@ -427,6 +436,7 @@ impl LocalModelBuilder {
             http_metrics_port: self.http_metrics_port,
             metrics_config: self.metrics_config.clone(),
             frontend_api_config: self.frontend_api_config.clone(),
+            frontend_image_fetch: self.frontend_image_fetch,
             tls_cert_path: self.tls_cert_path.take(),
             tls_key_path: self.tls_key_path.take(),
             tls_client_ca_cert_path: self.tls_client_ca_cert_path.take(),
@@ -452,6 +462,7 @@ pub struct LocalModel {
     http_metrics_port: Option<u16>,
     metrics_config: MetricsConfig,
     frontend_api_config: FrontendApiConfig,
+    frontend_image_fetch: bool,
     tls_cert_path: Option<PathBuf>,
     tls_key_path: Option<PathBuf>,
     tls_client_ca_cert_path: Option<PathBuf>,
@@ -574,6 +585,10 @@ impl LocalModel {
 
     pub fn metrics_config(&self) -> &MetricsConfig {
         &self.metrics_config
+    }
+
+    pub fn frontend_image_fetch(&self) -> bool {
+        self.frontend_image_fetch
     }
 
     pub fn frontend_api_config(&self) -> &FrontendApiConfig {

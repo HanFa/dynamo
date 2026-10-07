@@ -37,7 +37,8 @@ use crate::{
     model_card::ModelDeploymentCard,
     model_type::{ModelInput, ModelType},
     preprocessor::{
-        OpenAIPreprocessor, PreprocessedEmbeddingRequest, prompt::prompt_formatter_from_mdc,
+        OpenAIPreprocessor, PreprocessedEmbeddingRequest,
+        media::image_fetch_service::FrontendImageService, prompt::prompt_formatter_from_mdc,
     },
     protocols::{
         common::llm_backend::EmbeddingsEngineOutput,
@@ -192,6 +193,8 @@ pub struct ModelWatcher {
     model_update_dispatch:
         parking_lot::Mutex<Option<tokio::sync::mpsc::UnboundedSender<ModelUpdate>>>,
     chat_engine_factory: Option<ChatEngineFactoryCallback>,
+    frontend_image_fetch: bool,
+    frontend_image_services: tokio::sync::Mutex<HashMap<String, Arc<FrontendImageService>>>,
     prefill_load_estimator: Option<Arc<dyn PrefillLoadEstimator>>,
     metrics: Arc<Metrics>,
     /// Frontend's `--model-path`. Threaded into `download_config` so
@@ -311,6 +314,8 @@ impl ModelWatcher {
             chat_engine_factory,
             prefill_load_estimator,
             metrics,
+            frontend_image_fetch: false,
+            frontend_image_services: tokio::sync::Mutex::new(HashMap::new()),
             local_model_path: None,
             tokenizer_backend: None,
             tokenizer_fallback_enabled: None,
@@ -321,6 +326,10 @@ impl ModelWatcher {
 
     pub fn set_notify_on_model_update(&mut self, tx: Sender<ModelUpdate>) {
         self.model_update_tx = Some(tx);
+    }
+
+    pub fn set_frontend_image_fetch(&mut self, enabled: bool) {
+        self.frontend_image_fetch = enabled;
     }
 
     pub fn set_local_model_path(&mut self, path: Option<PathBuf>) {
@@ -706,8 +715,27 @@ impl ModelWatcher {
                     )
                 } else if let Some(tk) = tokenizer.clone() {
                     // Only chat pipelines use speculative prefill.
-                    let preprocessor =
-                        worker_set_chat_preprocessor(card, tk.clone(), &cancellation)?;
+                    let image_service = if self.frontend_image_fetch && card.media_decoder.is_none()
+                    {
+                        let mut services = self.frontend_image_services.lock().await;
+                        let service = if let Some(service) = services.get(&namespace) {
+                            service.clone()
+                        } else {
+                            let service =
+                                FrontendImageService::start(&self.drt, &namespace).await?;
+                            services.insert(namespace.clone(), service.clone());
+                            service
+                        };
+                        Some(service)
+                    } else {
+                        None
+                    };
+                    let preprocessor = worker_set_chat_preprocessor(
+                        card,
+                        tk.clone(),
+                        &cancellation,
+                        image_service,
+                    )?;
                     Some(
                         routing
                             .build_pipeline::<
@@ -1448,17 +1476,19 @@ fn worker_set_chat_preprocessor(
     card: &ModelDeploymentCard,
     tokenizer: crate::tokenizers::Tokenizer,
     cancellation: &CancellationToken,
+    frontend_image_service: Option<Arc<FrontendImageService>>,
 ) -> anyhow::Result<Arc<OpenAIPreprocessor>> {
     let PromptFormatter::OAI(formatter) =
         prompt_formatter_from_mdc(card).context("prompt_formatter_from_mdc")?;
     // A retained pipeline must stop its warmups when its WorkerSet is retired.
-    OpenAIPreprocessor::new_with_parts_and_cancel(
+    OpenAIPreprocessor::new_with_parts_and_image_fetch(
         card.clone(),
         formatter,
         tokenizer,
         Some(cancellation.clone()),
+        frontend_image_service,
     )
-    .context("OpenAIPreprocessor.new_with_parts_and_cancel")
+    .context("OpenAIPreprocessor.new_with_parts_and_image_fetch")
 }
 
 #[cfg(test)]
@@ -1569,7 +1599,7 @@ mod tests {
             let runtime_cancellation = CancellationToken::new();
             let cancellation = runtime_cancellation.child_token();
             let preprocessor =
-                worker_set_chat_preprocessor(&card, card.tokenizer().unwrap(), &cancellation)
+                worker_set_chat_preprocessor(&card, card.tokenizer().unwrap(), &cancellation, None)
                     .unwrap()
                     .into_operator();
             let backend = Arc::new(CompletingBackend::default());

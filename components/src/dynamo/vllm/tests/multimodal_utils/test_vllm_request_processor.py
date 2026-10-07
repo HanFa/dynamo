@@ -99,11 +99,40 @@ async def test_extracts_mixed_url_data_url_and_decoded_media():
 
     assert result == {"image": image, "video": video, "audio": [audio_a, audio_b]}
     processor.image_loader.load_image_batch.assert_awaited_once_with(
-        image_items, cache_scope=None, preserve_uuid_slots=True
+        image_items,
+        cache_scope=None,
+        preserve_uuid_slots=True,
+        image_fetches=None,
     )
     processor.video_loader.load_video_batch.assert_awaited_once_with(video_items, {})
     processor.audio_loader.load_audio_batch.assert_awaited_once_with(audio_items)
     processor.audio_loader.load_audio.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_frontend_image_references_reach_the_worker_cache_lazily():
+    processor = _processor()
+    image_items = [{"Url": "https://example.com/image.png"}, {"UuidOnly": "cached"}]
+    reference = {
+        "endpoint": "dynamo.images-11111111111141118111111111111111.fetch",
+        "token": "22222222-2222-4222-8222-222222222222",
+    }
+    await processor.extract_multimodal_data(
+        {
+            "multi_modal_data": {"image_url": image_items},
+            "image_fetches": [reference, None],
+            "image_cache_scope": "session-42",
+        },
+        "request-1",
+        None,
+    )
+    kwargs = processor.image_loader.load_image_batch.call_args.kwargs
+    assert kwargs["cache_scope"] == "session-42"
+    assert kwargs["preserve_uuid_slots"] is True
+    callbacks = kwargs["image_fetches"]
+    assert callable(callbacks[0])
+    assert callbacks[0].args[0] == reference
+    assert callbacks[1] is None
 
 
 @pytest.mark.asyncio
@@ -121,7 +150,10 @@ async def test_image_cache_uses_frontend_scope():
     )
 
     processor.image_loader.load_image_batch.assert_awaited_once_with(
-        image_items, cache_scope="session-42", preserve_uuid_slots=True
+        image_items,
+        cache_scope="session-42",
+        preserve_uuid_slots=True,
+        image_fetches=None,
     )
 
 
@@ -140,7 +172,10 @@ async def test_image_cache_has_no_scope_for_malformed_scope():
     )
 
     processor.image_loader.load_image_batch.assert_awaited_once_with(
-        image_items, cache_scope=None, preserve_uuid_slots=True
+        image_items,
+        cache_scope=None,
+        preserve_uuid_slots=True,
+        image_fetches=None,
     )
 
 
@@ -333,7 +368,10 @@ async def test_extracts_uuid_only_media_as_aligned_none_slots():
 
     assert result == {"image": [image, None]}
     processor.image_loader.load_image_batch.assert_awaited_once_with(
-        image_items, cache_scope=None, preserve_uuid_slots=True
+        image_items,
+        cache_scope=None,
+        preserve_uuid_slots=True,
+        image_fetches=None,
     )
     processor.embedding_loader.load_multimodal_embeddings.assert_not_awaited()
 
@@ -352,7 +390,10 @@ async def test_extracts_uuid_only_unified_vision_chunk_as_bare_none_slot():
 
     assert result == {"vision_chunk": [None]}
     processor.image_loader.load_image_batch.assert_awaited_once_with(
-        image_items, cache_scope=None, preserve_uuid_slots=True
+        image_items,
+        cache_scope=None,
+        preserve_uuid_slots=True,
+        image_fetches=None,
     )
 
 
@@ -1178,7 +1219,10 @@ async def test_non_qwen_decode_keeps_original_tokens_when_image_loads():
     assert "cache_salt" not in prepared.prompt
     assert prepared.prompt.get("type") != "multimodal"
     processor.image_loader.load_image_batch.assert_awaited_once_with(
-        image_items, cache_scope=None, preserve_uuid_slots=True
+        image_items,
+        cache_scope=None,
+        preserve_uuid_slots=True,
+        image_fetches=None,
     )
 
 
@@ -1319,7 +1363,10 @@ async def test_non_qwen_decode_awaits_image_loader_for_url():
     assert prepared.prompt["multi_modal_data"] == {"image": image}
     assert "cache_salt" not in prepared.prompt
     processor.image_loader.load_image_batch.assert_awaited_once_with(
-        image_items, cache_scope=None, preserve_uuid_slots=True
+        image_items,
+        cache_scope=None,
+        preserve_uuid_slots=True,
+        image_fetches=None,
     )
     called_items = processor.image_loader.load_image_batch.call_args[0][0]
     assert called_items[0]["Url"] == "https://example.com/a1b2c3d4e5f60718.png"
@@ -1355,7 +1402,10 @@ async def test_non_qwen_decode_loads_data_url_via_image_loader():
     assert prepared.prompt["multi_modal_data"] == {"image": image}
     assert "cache_salt" not in prepared.prompt
     processor.image_loader.load_image_batch.assert_awaited_once_with(
-        image_items, cache_scope=None, preserve_uuid_slots=True
+        image_items,
+        cache_scope=None,
+        preserve_uuid_slots=True,
+        image_fetches=None,
     )
     called_items = processor.image_loader.load_image_batch.call_args[0][0]
     assert called_items[0]["Url"] == data_url
@@ -1395,7 +1445,10 @@ async def test_non_qwen_decode_loads_decoded_nixl_when_frontend_decoding():
     assert prepared.prompt["multi_modal_data"] == {"image": image}
     assert "cache_salt" not in prepared.prompt
     processor.image_loader.load_image_batch.assert_awaited_once_with(
-        image_items, cache_scope=None, preserve_uuid_slots=True
+        image_items,
+        cache_scope=None,
+        preserve_uuid_slots=True,
+        image_fetches=None,
     )
 
 

@@ -3264,6 +3264,7 @@ class EntrypointArgs:
         enable_streaming_reasoning_dispatch: Optional[bool] = None,
         tokenizer_backend: Optional[str] = None,
         tokenizer_fallback: Optional[bool] = None,
+        frontend_image_fetch: bool = False,
     ) -> None:
         """
         Create EntrypointArgs.
@@ -3299,6 +3300,7 @@ class EntrypointArgs:
             enable_streaming_tool_dispatch: Optional streaming tool dispatch override
             enable_streaming_reasoning_dispatch: Optional streaming reasoning dispatch override
             tokenizer_backend: Optional tokenizer backend override ("default", "fastokens", or "basetenkenizer")
+            frontend_image_fetch: Fetch HTTP(S) images once per request in the Rust frontend
             tokenizer_fallback: Whether alternate tokenizer load failures fall back to HuggingFace
         """
         ...

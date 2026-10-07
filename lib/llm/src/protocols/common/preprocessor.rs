@@ -288,6 +288,15 @@ pub type MultimodalDataMap = std::collections::HashMap<String, Vec<MultimodalDat
 /// Backend cache UUIDs aligned positionally with multimodal data slots.
 pub type MultimodalUuidMap = std::collections::HashMap<String, Vec<Option<String>>>;
 
+/// Opaque reference to one request-scoped image on its owning frontend.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct ImageFetchReference {
+    pub endpoint: String,
+    // Keep the Python wire representation a string, including with MessagePack.
+    #[serde(with = "uuid::serde::simple")]
+    pub token: Uuid,
+}
+
 /// [`PreprocessedRequest`] is the internal representation of an LLM request. The `dynamo.llm-preprocessor`
 /// crate is responsible for converting request from the public APIs to this internal representation.
 #[derive(Serialize, Deserialize, Debug, Clone, Builder)]
@@ -346,6 +355,18 @@ pub struct PreprocessedRequest {
     #[builder(default)]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub multi_modal_uuids: Option<MultimodalUuidMap>,
+
+    /// Optional request-scoped image futures aligned with `multi_modal_data["image_url"]`.
+    /// URLs remain unchanged so N-2 workers can use their ordinary HTTP loader.
+    #[builder(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image_fetches: Option<Vec<Option<ImageFetchReference>>>,
+
+    /// Owns pending fetches locally; never crosses the worker wire boundary.
+    #[builder(default)]
+    #[serde(skip)]
+    pub(crate) image_fetch_lease:
+        Option<Arc<crate::preprocessor::media::image_fetch_service::ImageFetchLease>>,
 
     /// Optional multimodal routing-only fields (separate from execution payload).
     #[builder(default)]

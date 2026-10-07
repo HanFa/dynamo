@@ -320,6 +320,19 @@ impl MediaFetcher {
     /// across every outbound HTTP request in the frontend should reuse this
     /// — the connection pool stays warm and SSRF policy can't be bypassed.
     pub fn build_http_client(&self) -> Result<reqwest::Client> {
+        self.http_client_builder().build().map_err(Into::into)
+    }
+
+    /// A proxy can resolve destinations outside the checked DNS resolver.
+    /// Encoded frontend fetches use direct connections to preserve that policy.
+    pub(crate) fn build_direct_http_client(&self) -> Result<reqwest::Client> {
+        self.http_client_builder()
+            .no_proxy()
+            .build()
+            .map_err(Into::into)
+    }
+
+    fn http_client_builder(&self) -> reqwest::ClientBuilder {
         let fetcher_for_redirects = self.clone();
         let redirect_policy = Policy::custom(move |attempt| {
             if attempt.previous().len() >= MAX_REDIRECTS {
@@ -344,7 +357,7 @@ impl MediaFetcher {
             builder = builder.timeout(timeout);
         }
 
-        Ok(builder.build()?)
+        builder
     }
 }
 

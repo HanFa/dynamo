@@ -3,6 +3,8 @@
 
 mod common;
 mod decoders;
+pub(crate) mod frontend_image_fetch;
+pub(crate) mod image_fetch_service;
 mod jpeg_turbo;
 mod loader;
 mod rdma;

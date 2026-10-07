@@ -29,6 +29,9 @@ use dynamo_kv_router::{
 use dynamo_runtime::DistributedRuntime;
 use dynamo_runtime::metrics::MetricsHierarchy;
 
+#[cfg(test)]
+mod image_fetch_tests;
+
 /// Dynamo's complete discovery-backed HTTP frontend.
 ///
 /// The default frontend resolves worker selection from its configuration.
@@ -263,6 +266,7 @@ async fn run_with_router_plugins(
                 chat_engine_factory.clone(),
                 prefill_load_estimator.clone(),
                 local_model_path,
+                model.frontend_image_fetch(),
                 model.runtime_config().tokenizer_backend,
                 model.runtime_config().tokenizer_fallback_enabled,
                 generate_engine_capabilities,
@@ -352,6 +356,7 @@ async fn run_watcher(
     chat_engine_factory: Option<ChatEngineFactoryCallback>,
     prefill_load_estimator: Option<Arc<dyn dynamo_kv_router::PrefillLoadEstimator>>,
     local_model_path: Option<PathBuf>,
+    frontend_image_fetch: bool,
     tokenizer_backend: Option<TokenizerBackend>,
     tokenizer_fallback_enabled: Option<bool>,
     generate_engine_capabilities: Vec<&'static str>,
@@ -377,6 +382,7 @@ async fn run_watcher(
         plugins,
     );
     watch_obj.set_local_model_path(local_model_path);
+    watch_obj.set_frontend_image_fetch(frontend_image_fetch);
     watch_obj.set_tokenizer_backend(tokenizer_backend);
     watch_obj.set_tokenizer_fallback_enabled(tokenizer_fallback_enabled);
     watch_obj.set_generate_engine_capabilities(generate_engine_capabilities);

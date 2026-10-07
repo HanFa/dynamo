@@ -11,6 +11,8 @@
 //!
 //! The Preprocessor will accept any IngressRequest and transform it to a BackendRequest.
 
+#[cfg(test)]
+mod frontend_image_fetch_tests;
 pub mod media;
 #[cfg(feature = "mm-routing")]
 pub mod mm_routing;
@@ -68,6 +70,10 @@ use crate::model_card::ModelInfoType;
 use crate::model_card::{ModelDeploymentCard, ModelInfo, PromptFormatterArtifact};
 #[cfg(feature = "mm-routing")]
 use crate::preprocessor::media::MediaFetcher;
+use crate::preprocessor::media::frontend_image_fetch::FrontendImageFetcher;
+use crate::preprocessor::media::image_fetch_service::FrontendImageService;
+#[cfg(feature = "mm-routing")]
+use crate::preprocessor::media::image_fetch_service::PendingImage;
 use crate::preprocessor::media::{MediaDecoder, MediaLoader, max_data_url_bytes};
 use crate::protocols::common::preprocessor::{
     MultimodalData, MultimodalDataMap, MultimodalUuidMap, PreprocessedRequestBuilder, RoutingHints,
@@ -1714,6 +1720,8 @@ pub struct OpenAIPreprocessor {
     /// ModelRuntimeConfig; disabled for all other models.
     normalize_tool_call_args: bool,
     media_loader: Option<MediaLoader>,
+    frontend_image_fetcher: Option<Arc<FrontendImageFetcher>>,
+    frontend_image_service: Option<Arc<FrontendImageService>>,
     /// Engine-published request-token admission policy.
     token_budget: Option<TokenBudget>,
     /// Model context limit used by the embedding truncation contract.
@@ -2500,7 +2508,14 @@ impl OpenAIPreprocessor {
         let tokenizer = mdc.tokenizer()?;
         let PromptFormatter::OAI(formatter) = embedding_prompt_formatter(&mdc)?;
         let embedding_tokenizers = EmbeddingTokenizerState::new(&mdc)?;
-        Self::new_with_parts_inner(mdc, formatter, tokenizer, Some(embedding_tokenizers), None)
+        Self::new_with_parts_inner(
+            mdc,
+            formatter,
+            tokenizer,
+            Some(embedding_tokenizers),
+            None,
+            None,
+        )
     }
 
     pub fn new_with_parts(
@@ -2518,7 +2533,31 @@ impl OpenAIPreprocessor {
         tokenizer: crate::tokenizers::Tokenizer,
         speculative_prefill_cancel: Option<CancellationToken>,
     ) -> Result<Arc<Self>> {
-        Self::new_with_parts_inner(mdc, formatter, tokenizer, None, speculative_prefill_cancel)
+        Self::new_with_parts_and_image_fetch(
+            mdc,
+            formatter,
+            tokenizer,
+            speculative_prefill_cancel,
+            None,
+        )
+    }
+
+    /// Enable encoded image fetching without changing the worker's model card.
+    pub(crate) fn new_with_parts_and_image_fetch(
+        mdc: ModelDeploymentCard,
+        formatter: Arc<dyn OAIPromptFormatter>,
+        tokenizer: crate::tokenizers::Tokenizer,
+        speculative_prefill_cancel: Option<CancellationToken>,
+        frontend_image_service: Option<Arc<FrontendImageService>>,
+    ) -> Result<Arc<Self>> {
+        Self::new_with_parts_inner(
+            mdc,
+            formatter,
+            tokenizer,
+            None,
+            speculative_prefill_cancel,
+            frontend_image_service,
+        )
     }
 
     fn new_with_parts_inner(
@@ -2527,6 +2566,7 @@ impl OpenAIPreprocessor {
         tokenizer: crate::tokenizers::Tokenizer,
         embedding_tokenizers: Option<EmbeddingTokenizerState>,
         speculative_prefill_cancel: Option<CancellationToken>,
+        frontend_image_service: Option<Arc<FrontendImageService>>,
     ) -> Result<Arc<Self>> {
         let mdcsum = mdc.mdcsum().to_string();
         let tokenizer: Arc<dyn Tokenizer> = (*tokenizer).clone();
@@ -2626,6 +2666,16 @@ impl OpenAIPreprocessor {
                 )
             });
 
+        let frontend_image_fetcher =
+            if frontend_image_service.is_some() && mdc.media_decoder.is_none() {
+                Some(Arc::new(FrontendImageFetcher::new(
+                    mdc.media_fetcher
+                        .clone()
+                        .unwrap_or_else(crate::preprocessor::media::MediaFetcher::from_env),
+                )?))
+            } else {
+                None
+            };
         let media_loader = match mdc.media_decoder {
             Some(media_decoder) => Some(MediaLoader::new(media_decoder, mdc.media_fetcher)?),
             None => None,
@@ -2896,6 +2946,8 @@ impl OpenAIPreprocessor {
             parser_requires_special_tokens,
             normalize_tool_call_args,
             media_loader,
+            frontend_image_fetcher,
+            frontend_image_service,
             token_budget,
             context_length,
             speculative_prefill_tasks: speculative_prefill::PrefillTasks::new(
@@ -3606,7 +3658,7 @@ impl OpenAIPreprocessor {
         // URLs here and resolve dims via header-only HTTP after the loop so we
         // can issue all fetches in parallel.
         #[cfg(feature = "mm-routing")]
-        let mut url_passthrough_images: Vec<(u64, String)> = Vec::new();
+        let mut url_passthrough_images: Vec<(u64, usize)> = Vec::new();
 
         let Some(messages) = request.typed_messages() else {
             return Ok((Vec::new(), None));
@@ -3682,7 +3734,7 @@ impl OpenAIPreprocessor {
                             #[cfg(feature = "mm-routing")]
                             if type_str == "image_url" {
                                 let mm_hash = Self::hash_image_url(url.as_str());
-                                url_passthrough_images.push((mm_hash, url.as_str().to_string()));
+                                url_passthrough_images.push((mm_hash, slot_idx));
                             }
                         }
                         slots.push(MultimodalData::Url(url));
@@ -3857,18 +3909,49 @@ impl OpenAIPreprocessor {
             }
         }
 
+        let prefetched = if let (Some(fetcher), Some(service)) =
+            (&self.frontend_image_fetcher, &self.frontend_image_service)
+        {
+            let (references, lease) = service.prefetch(fetcher.clone(), &media_map).await?;
+            if references.iter().any(Option::is_some) {
+                builder.image_fetches(Some(references.clone()));
+                builder.image_fetch_lease(Some(lease.clone()));
+            }
+            Some((references, lease))
+        } else {
+            None
+        };
+        #[cfg(not(feature = "mm-routing"))]
+        let _ = prefetched;
+
         // URL-passthrough path (media_loader is None): fetch image headers in
         // parallel to get (W, H) per image without downloading the full bytes.
         // Enables MM-aware routing for backends that register
         // `media_decoder: null` and decode images on the worker.
         #[cfg(feature = "mm-routing")]
         if !has_user_uuid && !url_passthrough_images.is_empty() {
-            let dim_results =
-                futures::future::join_all(url_passthrough_images.iter().map(|(mm_hash, url)| {
-                    Self::fetch_image_dims(*mm_hash, url, self.routing_image_dimension_policy)
-                }))
-                .await;
-            for ((mm_hash, url), dim_res) in url_passthrough_images.into_iter().zip(dim_results) {
+            let dim_results = futures::future::join_all(url_passthrough_images.iter().map(
+                |(mm_hash, slot_idx)| {
+                    let MultimodalData::Url(url) = &media_map["image_url"][*slot_idx] else {
+                        unreachable!("URL-passthrough image slot must contain a URL");
+                    };
+                    let pending = prefetched.as_ref().and_then(|(references, lease)| {
+                        references[*slot_idx]
+                            .as_ref()
+                            .and_then(|reference| lease.image(reference))
+                    });
+                    // A dimension-cache hit never waits for the speculative download.
+                    // A miss shares that download instead of issuing a Range GET.
+                    Self::fetch_image_dims_with_prefetch(
+                        *mm_hash,
+                        url.as_str(),
+                        self.routing_image_dimension_policy,
+                        pending,
+                    )
+                },
+            ))
+            .await;
+            for ((mm_hash, _), dim_res) in url_passthrough_images.into_iter().zip(dim_results) {
                 match dim_res {
                     Ok((w, h)) => {
                         if let Some(counter) = self
@@ -3899,20 +3982,9 @@ impl OpenAIPreprocessor {
                         if MediaFetcher::is_policy_rejection(&e) {
                             return Err(e);
                         }
-                        // Redact `data:` URIs to just the media-type prefix —
-                        // the comma-separated payload is the entire (base64)
-                        // image body and ships in logs would be log bloat /
-                        // potential PII spillage if logs are aggregated.
-                        let url_for_log = if url.starts_with("data:") {
-                            url.split_once(',')
-                                .map(|(p, _)| format!("{p},<redacted>"))
-                                .unwrap_or_else(|| "data:<redacted>".to_string())
-                        } else {
-                            url.to_string()
-                        };
                         tracing::warn!(
                             target: "mm_routing",
-                            url = %url_for_log,
+                            mm_hash,
                             error = %e,
                             "mm-routing: failed to fetch image dims; MM routing entry skipped"
                         );
@@ -4475,10 +4547,11 @@ impl OpenAIPreprocessor {
     /// sticky-routing workloads pay 4–5× HTTP Range fetches per request just
     /// to compute routing tokens.
     #[cfg(feature = "mm-routing")]
-    async fn fetch_image_dims(
+    async fn fetch_image_dims_with_prefetch(
         mm_hash: u64,
         url: &str,
         dimension_policy: RoutingImageDimensionPolicy,
+        pending: Option<Arc<PendingImage>>,
     ) -> Result<(u32, u32)> {
         use moka::future::Cache;
         use std::sync::LazyLock;
@@ -4517,9 +4590,18 @@ impl OpenAIPreprocessor {
         let url_owned = url.to_string();
         DIM_CACHE
             .try_get_with(cache_key, async move {
-                Self::fetch_image_dims_uncached(&url_owned, dimension_policy)
-                    .await
-                    .map_err(ImageDimFetchFailure::from_error)
+                let result = async {
+                    let image = match pending {
+                        Some(image) => Some(image.get().await?),
+                        None => None,
+                    };
+                    let url = image
+                        .as_ref()
+                        .map_or(url_owned.as_str(), |image| image.data.as_str());
+                    Self::fetch_image_dims_uncached(url, dimension_policy).await
+                }
+                .await;
+                result.map_err(ImageDimFetchFailure::from_error)
             })
             .await
             .map_err(|error| error.to_error())
@@ -7588,7 +7670,7 @@ impl
         };
 
         // convert the chat completion request to a common completion request
-        let (mut common_request, annotations, prompt_injected_reasoning, image_tokens) = self
+        let preprocess = self
             .preprocess_request_with_options(
                 &request,
                 tracker.as_deref(),
@@ -7599,8 +7681,23 @@ impl
                     .flatten()
                     .map(|name| name.as_ref().clone()),
             )
-            .instrument(preprocessing.clone())
-            .await?;
+            .instrument(preprocessing.clone());
+        let request_context = context.context();
+        let (mut common_request, annotations, prompt_injected_reasoning, image_tokens) = tokio::select! {
+            result = preprocess => result?,
+            _ = request_context.stopped(), if self.frontend_image_fetcher.is_some() => {
+                return Err(DynamoError::builder()
+                    .class(dynamo_runtime::error::ErrorClass::Cancelled)
+                    .public_message("Request cancelled during image fetching")
+                    .build().into());
+            }
+            _ = request_context.killed(), if self.frontend_image_fetcher.is_some() => {
+                return Err(DynamoError::builder()
+                    .class(dynamo_runtime::error::ErrorClass::Cancelled)
+                    .public_message("Request cancelled during image fetching")
+                    .build().into());
+            }
+        };
         attach_request_context_metadata(&mut common_request, &context);
 
         let guided_tool_constraint = self.apply_tool_choice_guided_decoding(
@@ -7644,6 +7741,9 @@ impl
             response_generator.update_isl(isl);
         }
 
+        // Retain images through the entire response, including retries and P/D.
+        // Dropping an errored/cancelled stream aborts downloads and removes tokens.
+        let image_fetch_lease = common_request.image_fetch_lease.take();
         // repack the common completion request
         let common_request = context.map(|_| common_request);
 
@@ -7725,7 +7825,10 @@ impl
             crate::request_trace::wrap_chat_request_end_stream(final_stream, trace_state);
 
         // prepend the annotations to the response stream
-        let stream = annotations_stream.chain(final_stream);
+        let stream = annotations_stream.chain(final_stream).map(move |item| {
+            let _ = &image_fetch_lease;
+            item
+        });
 
         // return the response stream - single boxing at the end
         Ok(ResponseStream::new(Box::pin(stream), context))

@@ -636,7 +636,8 @@ async def test_malformed_data_url_batch_raises_value_error(
         await loader.load_image_batch([{URL_VARIANT_KEY: bad_url}])
 
     assert not isinstance(exc_info.value, UrlValidationError)
-    assert "Failed to decoding image" in str(exc_info.value)
+    assert "Failed to decode inline image" in str(exc_info.value)
+    assert bad_url not in str(exc_info.value)
 
 
 async def test_unexpected_decoder_error_not_wrapped_as_value_error(

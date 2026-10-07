@@ -65,6 +65,7 @@ pub async fn run(
                 prefill_load_estimator.clone(),
                 local_model_path,
                 model.metrics_prefix(),
+                model.frontend_image_fetch(),
                 model.runtime_config().tokenizer_backend,
                 model.runtime_config().tokenizer_fallback_enabled,
             )
@@ -139,6 +140,7 @@ async fn run_watcher(
     prefill_load_estimator: Option<Arc<dyn dynamo_kv_router::PrefillLoadEstimator>>,
     local_model_path: Option<PathBuf>,
     metrics_prefix: Option<String>,
+    frontend_image_fetch: bool,
     tokenizer_backend: Option<TokenizerBackend>,
     tokenizer_fallback_enabled: Option<bool>,
 ) -> anyhow::Result<()> {
@@ -162,6 +164,7 @@ async fn run_watcher(
         metrics,
     );
     watch_obj.set_local_model_path(local_model_path);
+    watch_obj.set_frontend_image_fetch(frontend_image_fetch);
     watch_obj.set_tokenizer_backend(tokenizer_backend);
     watch_obj.set_tokenizer_fallback_enabled(tokenizer_fallback_enabled);
     tracing::debug!("Waiting for remote model");
