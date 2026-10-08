@@ -1,3 +1,8 @@
+<!--
+SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+SPDX-License-Identifier: Apache-2.0
+-->
+
 # Media decoding in the frontend
 
 
@@ -127,3 +132,131 @@ curl -X POST http://localhost:8000/v1/chat/completions \
 ### Misc
 - [ ] Observability on performance, memory usage and input distributions
 - [x] Per-request decoding options
+
+## Shared decoder fork validation
+
+The experimental `dynamo-llm/shared-media` feature uses the extracted decoder
+in `dynamo-multimodal`. It is off by default until the shared crate is
+published. The original implementation remains available for before/after
+comparison. Preserve this ordering for upstream rollout: publish the crate,
+replace the fork revision with that released version, enable the new path,
+then remove the original decoder code and this temporary feature.
+
+The existing `Decoder` interface, serialized model/runtime options, environment
+overrides, async CPU offloading, media content hashes and NIXL storage remain
+in Dynamo. The shared crate returns owned pixel vectors and metadata. Dynamo
+converts these to the same `SystemStorage` and metadata as before, with the
+same registration and lifetime management. Its existing `tokio_rayon` bridge
+provides request concurrency; leave the shared crate's pool unarmed.
+
+### Build and install
+
+```bash
+# Rust image path, no FFmpeg required
+cargo test -p dynamo-llm --no-default-features --features shared-media \
+  preprocessor::media:: --lib
+# Image and video paths, with the existing FFmpeg 9 development environment
+cargo test -p dynamo-llm --no-default-features --features shared-media,media-ffmpeg \
+  preprocessor::media:: --lib
+# Existing Python extension, editable installation
+cd lib/bindings/python
+maturin develop --uv --features shared-media
+# Add media-ffmpeg to the feature list for video.
+```
+
+The bindings also forward `shared-media` for `maturin build`. No separate
+Python package or Python API is introduced. A clean source build additionally
+needs CMake and a C/C++ toolchain for the shared crate's existing TurboJPEG
+dependency; NASM enables x86 SIMD. The Dynamo-compatible JPEG path still loads
+the optional system TurboJPEG library and preserves fallback when absent.
+The shared crate includes full native JPEG notices with its Apache attribution.
+
+Video still links shared FFmpeg from the existing restricted native build.
+Keep the `_dynamo` SONAMEs, pkg-config aliases, auditwheel exclusions, loader
+configuration and FFmpeg source artifacts. Image-only wheels do not need
+FFmpeg. The FFmpeg-enabled container wheel remains dependent on its image's
+external FFmpeg libraries, as before.
+
+### Container matrix
+
+`--build-arg ENABLE_SHARED_MEDIA=true` forwards the feature through the source
+wheel builder. Its default is false. The existing `ENABLE_MEDIA_FFMPEG` flag
+continues selecting video independently. The table records renderer targets;
+it does not assert that every architecture has been built in this fork.
+
+| Framework/device | Architectures | Targets and migration treatment | Rust video default |
+| --- | --- | --- | --- |
+| vLLM CUDA 13.0 | amd64, arm64 | runtime, dev, local-dev, wheel_builder: opt-in feature forwarding; existing native handling retained | on |
+| vLLM XPU | amd64 | same source targets and feature forwarding | on |
+| vLLM CPU | amd64, arm64 accepted by renderer | same source targets; these unshipped builds retain their existing compliance exclusions | on |
+| SGLang CUDA 13.0 | amd64, arm64 | runtime, dev, local-dev, wheel_builder: opt-in feature forwarding | on |
+| SGLang XPU | amd64 | same targets; shared image decoding only; existing template excludes Rust FFmpeg | off |
+| TensorRT-LLM CUDA 13.1 | amd64, arm64 | runtime, dev, local-dev, wheel_builder: opt-in feature forwarding | off |
+| Dynamo CUDA 13.0 | amd64, arm64 | runtime, dev, local-dev, wheel_builder: opt-in feature forwarding | off |
+| Dynamo frontend | amd64, arm64 | consumes existing published wheels; no new source feature or media support | unchanged |
+| Dynamo planner | amd64, arm64 | no decoder build changes | unchanged |
+| Triton CUDA 13.4 | amd64, arm64 | runtime consumes prebuilt wheels; no source wheel_builder/dev targets | unchanged |
+| Base images, EPP, AWS/EFA derivatives | existing supported architectures | base/EPP unchanged; EFA derivatives inherit their runtime's feature and compliance handling | inherited |
+
+Generated Dockerfiles must come from `container/render.py`. Runtime FFmpeg
+CLI copies also support backend video encoding, so do not remove them when
+Rust video is disabled. The existing NOTICES/SBOM generation, license gates,
+source harvesting and codec scans remain release checks. The fork's git
+dependency notices are harvested alongside registry crate notices; switching
+to a published crate uses the existing registry path.
+
+### Parity and performance
+
+The feature-enabled Rust tests compare original and extracted image/video
+decoders through Dynamo's actual storage conversion, metadata serialization,
+hashing and concurrent async interface. Run the existing frontend-decoding
+integration suite on the supported backend/GPU environments as well:
+`tests/mm_router/test_router_rust_mm_frontend_decode_e2e.py`.
+
+Use the existing `image_decode` and `video_decode` Criterion benchmarks for
+before/after runs on the same machine, once without and once with
+`shared-media`. Enable `RUN_IMAGE_DECODE_SWEEP=1` and
+`RUN_VIDEO_DECODE_SWEEP=1` for the 1/8/32-concurrency cases. Keep JPEG backend,
+video sampling, native libraries, CPU affinity and input fixtures identical.
+Record batch latency and throughput separately from per-request latency;
+do not infer p95/p99 request latency from Criterion's batch averages.
+
+### Validation record (2026-10-08)
+
+Fork implementation based on Dynamo
+`16b2ae50032edbdde70a9e03a7e7056fac3b7c7d`, consuming frontend-crates
+`984199d41cfbf56e4083707a386501344a2b7f0c`. Validation used Linux x86_64,
+Rust 1.96.1, the restricted FFmpeg 9.0.1/libvpx 1.14.1 build from the shared
+crate's `build-ffmpeg.sh`, and system TurboJPEG 2.1.5. The checkout and Cargo
+home were isolated from the developer's existing installations.
+
+| Check | Result |
+| --- | --- |
+| Shared crate, all features | 69 tests passed, including image/video fixtures and armed/unarmed execution; Clippy with warnings denied passed |
+| Shared crate, `--no-default-features --features media-decode` | Passed without FFmpeg environment variables; dependency tree excludes FFmpeg, Dynamo runtime and NIXL |
+| Packaged crate | `cargo package --locked --offline` and all-feature tests from the extracted package passed; fixture and license files are included |
+| Dynamo media tests, `shared-media,media-ffmpeg`, no default features | 70 passed, including concurrent differential pixel/metadata/hash/ownership checks |
+| Rust license checks | `cargo deny --all-features check bans licenses` passed in both repositories |
+| Python bindings | Development-profile abi3 wheel built with shared image/video support; wheel and editable installations imported successfully in separate fresh Python 3.12 environments; existing image/video configuration APIs passed smoke checks |
+| Wheel compliance | Embedded SBOM contains 917 components including the shared crate; all pass Dynamo's license policy; NOTICES injection preserves full shared/native JPEG attribution and its RECORD digest |
+| FFmpeg linking/codecs | Extension links external `_dynamo` FFmpeg shared libraries; native build's positive/negative codec guards passed; runtime-layout filesystem scan found 36 allowed files and zero violations |
+| Compliance tests | 50 passed across license-text, Cargo SBOM and codec-scan suites |
+| Container templates | 66 applicable framework/device/architecture/target combinations rendered |
+
+The wheel smoke check used `maturin build --profile dev --features
+shared-media,media-ffmpeg --auditwheel skip`; it validates local installation
+with external native libraries, not a repaired manylinux release wheel. The
+native filesystem scan used the existing runtime's `/usr/local` layout and
+shipped-file selection, not a complete backend image. Python smoke checks do
+not exercise NIXL transfers. BuildKit's CPU wheel-builder Dockerfile check
+reports the same three existing warnings as the baseline (two undefined
+`LD_LIBRARY_PATH` references and an empty continuation), so it is not recorded
+as a passing build.
+
+Still required before enabling this upstream: full runtime/dev container builds
+for the affected architectures and feature combinations, their complete
+NOTICES/SBOM/source bundles and release license/codec gates, repaired release
+wheels, and `test_router_rust_mm_frontend_decode_e2e.py` on supported GPU
+backends with real NIXL registration and cleanup. Registry publication and
+consumption of that released crate also remain pending. The fork deliberately
+retains the original implementation until those rollout steps are complete.

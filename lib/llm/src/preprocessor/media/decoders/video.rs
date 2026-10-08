@@ -1,15 +1,20 @@
 // SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+#[cfg(any(not(feature = "shared-media"), test))]
 use std::io::Write;
+#[cfg(any(not(feature = "shared-media"), test))]
 use std::os::fd::AsRawFd;
 
 use anyhow::Result;
+#[cfg(any(not(feature = "shared-media"), test))]
 use ffmpeg_next::Rational;
+#[cfg(any(not(feature = "shared-media"), test))]
 use memfile::{CreateOptions, MemFile, Seal};
 use ndarray::Array4;
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
+#[cfg(any(not(feature = "shared-media"), test))]
 use video_rs::Time;
 
 use super::Decoder;
@@ -18,6 +23,7 @@ use crate::preprocessor::media::{
 };
 
 /// Small time buffer (seconds) to avoid edge cases when seeking near frame boundaries
+#[cfg(any(not(feature = "shared-media"), test))]
 const FRAME_TIME_BUFFER_SECS: f64 = 0.001;
 const DEFAULT_MAX_ALLOC: u64 = 512 * 1024 * 1024; // 512 MB
 
@@ -64,6 +70,7 @@ pub struct VideoMetadata {
     pub(crate) sampled_timestamps: Vec<f64>,
 }
 
+#[cfg(any(not(feature = "shared-media"), test))]
 fn get_num_requested_frames(
     config: &VideoDecoder,
     duration_secs: f64,
@@ -97,6 +104,7 @@ fn get_num_requested_frames(
     Ok(requested_frames)
 }
 
+#[cfg(any(not(feature = "shared-media"), test))]
 fn get_target_times(
     requested_frames: u64,
     duration_secs: f64,
@@ -126,6 +134,7 @@ fn get_target_times(
         .collect())
 }
 
+#[cfg(any(not(feature = "shared-media"), test))]
 fn get_frame_timestamp(frame: &ffmpeg_next::frame::Video, time_base: Rational) -> Result<f64> {
     anyhow::ensure!(!frame.is_corrupt(), "Frame is corrupt");
 
@@ -139,6 +148,7 @@ fn get_frame_timestamp(frame: &ffmpeg_next::frame::Video, time_base: Rational) -
     }
 }
 
+#[cfg(any(not(feature = "shared-media"), test))]
 fn get_sample_timestamp(
     config: &VideoDecoder,
     frame: &ffmpeg_next::frame::Video,
@@ -154,6 +164,7 @@ fn get_sample_timestamp(
     }
 }
 
+#[cfg(any(not(feature = "shared-media"), test))]
 fn handle_sample_error(
     config: &VideoDecoder,
     target_index: &mut usize,
@@ -169,6 +180,7 @@ fn handle_sample_error(
     Ok(*target_index == target_count)
 }
 
+#[cfg(any(not(feature = "shared-media"), test))]
 fn copy_rgb_frame(frame: &ffmpeg_next::frame::Video, output_buffer: &mut [u8]) -> Result<()> {
     let width = frame.width();
     let height = frame.height();
@@ -194,6 +206,7 @@ fn copy_rgb_frame(frame: &ffmpeg_next::frame::Video, output_buffer: &mut [u8]) -
     Ok(())
 }
 
+#[cfg(any(not(feature = "shared-media"), test))]
 fn convert_ffmpeg_frame_to_rgb(
     scaler: &mut ffmpeg_next::software::scaling::Context,
     decoded_frame: &ffmpeg_next::frame::Video,
@@ -204,6 +217,7 @@ fn convert_ffmpeg_frame_to_rgb(
     copy_rgb_frame(rgb_frame, output_buffer)
 }
 
+#[cfg(any(not(feature = "shared-media"), test))]
 fn video_open_error(error: ffmpeg_next::Error) -> anyhow::Error {
     anyhow::anyhow!(
         "failed to open the video for decoding: {error}. If the input uses a \
@@ -216,6 +230,7 @@ fn video_open_error(error: ffmpeg_next::Error) -> anyhow::Error {
     )
 }
 
+#[cfg(any(not(feature = "shared-media"), test))]
 fn decode_video(config: &VideoDecoder, bytes: Vec<u8>) -> Result<DecodedMediaData> {
     use ffmpeg_next::codec::context::Context;
     use ffmpeg_next::software::scaling::{Context as ScalingContext, Flags};
@@ -422,8 +437,44 @@ impl Decoder for VideoDecoder {
             "max_frames and num_frames cannot be specified at the same time"
         );
 
-        decode_video(self, data.into_bytes()?)
+        #[cfg(feature = "shared-media")]
+        {
+            decode_shared_video(self, data.into_bytes()?)
+        }
+        #[cfg(not(feature = "shared-media"))]
+        {
+            decode_video(self, data.into_bytes()?)
+        }
     }
+}
+
+#[cfg(feature = "shared-media")]
+fn decode_shared_video(config: &VideoDecoder, bytes: Vec<u8>) -> Result<DecodedMediaData> {
+    use dynamo_multimodal::media::video::{self as shared, VideoOptions};
+    let options = VideoOptions {
+        limits: shared::VideoDecoderLimits {
+            max_alloc: config.limits.max_alloc,
+        },
+        fps: config.fps,
+        max_frames: config.max_frames,
+        num_frames: config.num_frames,
+        strict: config.strict,
+    };
+    let video = shared::decode_video(bytes, &options)?;
+    let shape = (
+        video.num_frames,
+        video.height as usize,
+        video.width as usize,
+        3,
+    );
+    let array = Array4::from_shape_vec(shape, video.pixels)?;
+    let mut decoded: DecodedMediaData = array.try_into()?;
+    decoded.tensor_info.metadata = Some(DecodedMediaMetadata::Video(VideoMetadata {
+        source_fps: video.metadata.source_fps,
+        source_duration: video.metadata.source_duration,
+        sampled_timestamps: video.metadata.sampled_timestamps,
+    }));
+    Ok(decoded)
 }
 
 #[cfg(test)]
@@ -432,6 +483,47 @@ mod tests {
     use super::*;
     use rstest::rstest;
     use video_rs::Location;
+
+    #[cfg(feature = "shared-media")]
+    #[tokio::test]
+    async fn shared_video_preserves_sampling_pixels_metadata_hashes_and_ownership() {
+        use dynamo_memory::actions::Slice;
+        let (encoded, ..) = load_test_video("240p_10.mp4");
+        let bytes = encoded.into_bytes().unwrap();
+        for config in [
+            VideoDecoder {
+                num_frames: Some(5),
+                strict: true,
+                ..Default::default()
+            },
+            VideoDecoder {
+                fps: Some(0.5),
+                max_frames: Some(3),
+                ..Default::default()
+            },
+        ] {
+            let results = futures::future::try_join_all((0..4).map(|_| {
+                config
+                    .decode_async_with_video_hash(EncodedMediaData::from_bytes(bytes.clone()), true)
+            }))
+            .await
+            .unwrap();
+            let mut expected = decode_video(&config, bytes.clone()).unwrap();
+            expected.compute_content_hash(true);
+            for actual in results {
+                assert_eq!(actual.tensor_info.shape, expected.tensor_info.shape);
+                assert_eq!(actual.content_hash, expected.content_hash);
+                assert_eq!(
+                    serde_json::to_value(&actual.tensor_info.metadata).unwrap(),
+                    serde_json::to_value(&expected.tensor_info.metadata).unwrap()
+                );
+                // SAFETY: each decoded result owns its initialized storage.
+                assert_eq!(unsafe { actual.data.as_slice().unwrap() }, unsafe {
+                    expected.data.as_slice().unwrap()
+                });
+            }
+        }
+    }
 
     /// Load test video and parse expected dimensions from filename.
     /// Filename format: "{resolution}_{frames}.mp4" (e.g., "240p_10.mp4" -> 320x240, 10 frames)

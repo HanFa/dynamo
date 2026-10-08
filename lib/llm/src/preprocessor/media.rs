@@ -3,6 +3,7 @@
 
 mod common;
 mod decoders;
+#[cfg(any(not(feature = "shared-media"), test))]
 mod jpeg_turbo;
 mod loader;
 mod rdma;
@@ -18,7 +19,14 @@ pub use rdma::{DecodedMediaData, RdmaMediaDataDescriptor, get_nixl_agent, get_ni
 
 #[doc(hidden)]
 pub fn libjpeg_turbo_available() -> bool {
-    jpeg_turbo::available()
+    #[cfg(feature = "shared-media")]
+    {
+        dynamo_multimodal::media::image::turbojpeg_available()
+    }
+    #[cfg(not(feature = "shared-media"))]
+    {
+        jpeg_turbo::available()
+    }
 }
 
 pub(super) fn require_image_url(

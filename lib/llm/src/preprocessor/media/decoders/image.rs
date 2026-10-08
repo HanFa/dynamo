@@ -12,11 +12,16 @@ use utoipa::ToSchema;
 use super::super::common::EncodedMediaData;
 use super::super::rdma::DecodedMediaData;
 use super::{DecodedMediaMetadata, Decoder};
+#[cfg(any(not(feature = "shared-media"), test))]
 use backends::{
-    BackendAvailability, BackendDecline, DecodedImage, ImageDecodeBackend, ImageDecodeOutcome,
-    ImageDecodeRequest, image_reader_backend, turbojpeg_backend,
+    BackendDecline, DecodedImage, ImageDecodeBackend, ImageDecodeOutcome, ImageDecodeRequest,
+    image_reader_backend, turbojpeg_backend,
 };
 
+#[cfg(not(feature = "shared-media"))]
+use backends::BackendAvailability;
+
+#[cfg(any(not(feature = "shared-media"), test))]
 mod backends;
 
 const DEFAULT_MAX_ALLOC: u64 = 128 * 1024 * 1024; // 128 MB
@@ -60,6 +65,7 @@ impl Default for ImageDecoderLimits {
 }
 
 impl ImageDecoderLimits {
+    #[cfg(any(not(feature = "shared-media"), test))]
     fn validate_output(&self, width: u32, height: u32, channels: usize) -> Result<usize> {
         if self.max_image_width.is_some_and(|limit| width > limit)
             || self.max_image_height.is_some_and(|limit| height > limit)
@@ -133,9 +139,23 @@ impl Decoder for ImageDecoder {
         let bytes = data.into_bytes()?;
         self.warn_if_libjpeg_unavailable();
 
-        let format = image::guess_format(&bytes)?;
+        #[cfg(feature = "shared-media")]
+        {
+            self.decode_shared(&bytes)
+        }
+        #[cfg(not(feature = "shared-media"))]
+        {
+            self.decode_legacy(&bytes)
+        }
+    }
+}
+
+impl ImageDecoder {
+    #[cfg(any(not(feature = "shared-media"), test))]
+    fn decode_legacy(&self, bytes: &[u8]) -> Result<DecodedMediaData> {
+        let format = image::guess_format(bytes)?;
         let request = ImageDecodeRequest {
-            bytes: &bytes,
+            bytes,
             format,
             limits: &self.limits,
         };
@@ -161,6 +181,7 @@ impl Decoder for ImageDecoder {
     }
 }
 
+#[cfg(any(not(feature = "shared-media"), test))]
 fn ensure_fallback_allowed(
     backend: &str,
     reason: BackendDecline,
@@ -175,6 +196,7 @@ fn ensure_fallback_allowed(
     Ok(())
 }
 
+#[cfg(any(not(feature = "shared-media"), test))]
 fn decode_required_backend(
     backend: &dyn ImageDecodeBackend,
     request: ImageDecodeRequest<'_>,
@@ -187,6 +209,7 @@ fn decode_required_backend(
     }
 }
 
+#[cfg(any(not(feature = "shared-media"), test))]
 fn decoded_image_to_media_data(image: DecodedImage) -> Result<DecodedMediaData> {
     let channels = image.pixel_format.channels();
     let color_type = image.pixel_format.color_type();
@@ -202,6 +225,39 @@ fn decoded_image_to_media_data(image: DecodedImage) -> Result<DecodedMediaData> 
 }
 
 impl ImageDecoder {
+    #[cfg(feature = "shared-media")]
+    fn decode_shared(&self, bytes: &[u8]) -> Result<DecodedMediaData> {
+        use dynamo_multimodal::media::image::{self as shared, ImageOptions, JpegFallbackRequired};
+        let options = ImageOptions {
+            limits: shared::ImageDecoderLimits {
+                max_image_width: self.limits.max_image_width,
+                max_image_height: self.limits.max_image_height,
+                max_alloc: self.limits.max_alloc,
+            },
+            enable_libjpeg: self.enable_libjpeg,
+            require_libjpeg: std::env::var_os(REQUIRE_LIBJPEG_TURBO_TEST_ENV).is_some(),
+        };
+        let image = shared::decode_image(bytes, &options).map_err(|error| {
+            if let Some(JpegFallbackRequired(reason)) = error.downcast_ref::<JpegFallbackRequired>() {
+                anyhow::anyhow!("libjpeg_turbo was required by {REQUIRE_LIBJPEG_TURBO_TEST_ENV}, but the input would have fallen back to image::ImageReader: {reason}")
+            } else { error }
+        })?;
+        let color_type = image.pixel_format.color_type();
+        let shape = (
+            image.height as usize,
+            image.width as usize,
+            image.pixel_format.channels(),
+        );
+        let array = Array3::from_shape_vec(shape, image.pixels)?;
+        let mut decoded: DecodedMediaData = array.try_into()?;
+        decoded.tensor_info.metadata = Some(DecodedMediaMetadata::Image(ImageMetadata {
+            format: Some(image.source_format),
+            color_type,
+            layout: ImageLayout::HWC,
+        }));
+        Ok(decoded)
+    }
+
     #[doc(hidden)]
     pub fn with_libjpeg_for_benchmark(mut self, enabled: bool) -> Self {
         self.enable_libjpeg = enabled;
@@ -209,9 +265,14 @@ impl ImageDecoder {
     }
 
     pub(crate) fn warn_if_libjpeg_unavailable(&self) {
-        if self.enable_libjpeg
-            && turbojpeg_backend().availability() == BackendAvailability::Unavailable
-        {
+        if !self.enable_libjpeg {
+            return;
+        }
+        #[cfg(feature = "shared-media")]
+        let unavailable = !dynamo_multimodal::media::image::turbojpeg_available();
+        #[cfg(not(feature = "shared-media"))]
+        let unavailable = turbojpeg_backend().availability() == BackendAvailability::Unavailable;
+        if unavailable {
             LIBJPEG_TURBO_UNAVAILABLE_WARNING.call_once(|| {
                 if std::env::var_os(REQUIRE_LIBJPEG_TURBO_TEST_ENV).is_some() {
                     tracing::warn!(
@@ -604,6 +665,59 @@ mod tests {
                 assert_eq!(metadata.color_type, ColorType::L8);
             }
             other => panic!("expected image metadata, got {other:?}"),
+        }
+    }
+
+    #[cfg(feature = "shared-media")]
+    #[tokio::test]
+    async fn shared_decoder_preserves_pixels_metadata_hashes_and_concurrent_ownership() {
+        use dynamo_memory::actions::Slice;
+
+        let inputs = [
+            create_test_image(8, 9, 1, ImageFormat::Png),
+            create_test_image(8, 9, 3, ImageFormat::Png),
+            create_test_image(8, 9, 4, ImageFormat::Png),
+            pil_parity_fixture().0,
+        ];
+        for enabled in [false, true] {
+            let decoder = ImageDecoder::default().with_libjpeg_for_benchmark(enabled);
+            let mut results =
+                futures::future::try_join_all(inputs.iter().map(|bytes| {
+                    decoder.decode_async(EncodedMediaData::from_bytes(bytes.clone()))
+                }))
+                .await
+                .unwrap();
+            for (bytes, actual) in inputs.iter().zip(&mut results) {
+                let mut expected = decoder.decode_legacy(bytes).unwrap();
+                expected.compute_content_hash(false);
+                assert_eq!(actual.tensor_info.shape, expected.tensor_info.shape);
+                assert_eq!(actual.content_hash, expected.content_hash);
+                assert_eq!(
+                    serde_json::to_value(&actual.tensor_info.metadata).unwrap(),
+                    serde_json::to_value(&expected.tensor_info.metadata).unwrap()
+                );
+                // SAFETY: each decoded result owns its initialized storage.
+                assert_eq!(unsafe { actual.data.as_slice().unwrap() }, unsafe {
+                    expected.data.as_slice().unwrap()
+                });
+            }
+            // Results coexist until this point, exercising independent ownership.
+            drop(results);
+        }
+    }
+
+    #[cfg(feature = "shared-media")]
+    #[test]
+    fn shared_decoder_preserves_limit_and_malformed_input_errors() {
+        let mut decoder = ImageDecoder::default().with_libjpeg_for_benchmark(false);
+        decoder.limits.max_image_width = Some(1);
+        for bytes in [
+            create_test_image(8, 9, 3, ImageFormat::Png),
+            b"invalid".to_vec(),
+        ] {
+            let before = decoder.decode_legacy(&bytes).unwrap_err();
+            let after = decoder.decode_shared(&bytes).unwrap_err();
+            assert_eq!(format!("{before:#}"), format!("{after:#}"));
         }
     }
 

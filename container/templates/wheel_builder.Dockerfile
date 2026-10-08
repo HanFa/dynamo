@@ -595,6 +595,7 @@ COPY components/ /opt/dynamo/components/
 ARG USE_SCCACHE
 ARG TARGETARCH
 ARG ENABLE_MEDIA_FFMPEG
+ARG ENABLE_SHARED_MEDIA
 RUN --mount=type=secret,id=aws-web-identity-token,target=/run/secrets/aws-token \
     --mount=type=secret,id=aws-role-arn,env=AWS_ROLE_ARN \
     --mount=type=cache,target=/root/.cargo/registry,sharing=shared \
@@ -611,7 +612,9 @@ RUN --mount=type=secret,id=aws-web-identity-token,target=/run/secrets/aws-token 
     cd /opt/dynamo && \
     uv build --wheel --out-dir /opt/dynamo/dist && \
     cd /opt/dynamo/lib/bindings/python && \
-{% if framework == "sglang" and device == "xpu" %}    maturin build --release --features "kv-indexer,slot-tracker,select-service,mm-routing,ais-forward-pass,request-trace-s3,nvtx" --out /opt/dynamo/dist && \
+    SHARED_MEDIA_FEATURES="" && \
+    if [ "$ENABLE_SHARED_MEDIA" = "true" ]; then SHARED_MEDIA_FEATURES=",shared-media"; fi && \
+{% if framework == "sglang" and device == "xpu" %}    maturin build --release --features "kv-indexer,slot-tracker,select-service,mm-routing,ais-forward-pass,request-trace-s3,nvtx${SHARED_MEDIA_FEATURES}" --out /opt/dynamo/dist && \
 {% else %}    if [ "$ENABLE_MEDIA_FFMPEG" = "true" ]; then \
     # Skip maturin's built-in repair: it would graft the in-tree libav* into the
     # wheel, which the codec gate rejects. Repair with those sonames excluded so
@@ -632,7 +635,7 @@ RUN --mount=type=secret,id=aws-web-identity-token,target=/run/secrets/aws-token 
         esac && \
     MANYLINUX_POLICY=manylinux_{{ "2_35" if device == "cpu" else "2_28" }}_${ARCH_ALT} && \
 {% endif %}
-        maturin build --release --features "media-ffmpeg,kv-indexer,slot-tracker,select-service,mm-routing,ais-forward-pass,request-trace-s3,nvtx" --auditwheel skip --out target/wheels && \
+        maturin build --release --features "media-ffmpeg,kv-indexer,slot-tracker,select-service,mm-routing,ais-forward-pass,request-trace-s3,nvtx${SHARED_MEDIA_FEATURES}" --auditwheel skip --out target/wheels && \
         auditwheel repair \
             --exclude 'libavcodec_dynamo.so.*' \
             --exclude 'libavdevice_dynamo.so.*' \
@@ -645,7 +648,7 @@ RUN --mount=type=secret,id=aws-web-identity-token,target=/run/secrets/aws-token 
             --wheel-dir /opt/dynamo/dist \
             target/wheels/ai_dynamo_runtime-*.whl; \
     else \
-        maturin build --release --features "kv-indexer,slot-tracker,select-service,mm-routing,ais-forward-pass,request-trace-s3,nvtx" --out /opt/dynamo/dist; \
+        maturin build --release --features "kv-indexer,slot-tracker,select-service,mm-routing,ais-forward-pass,request-trace-s3,nvtx${SHARED_MEDIA_FEATURES}" --out /opt/dynamo/dist; \
     fi && \
 {% endif %}    /tmp/use-sccache.sh show-stats "Dynamo Runtime"
 
@@ -681,6 +684,7 @@ RUN --mount=type=cache,id=uv-root-{{ context.dynamo.uv_version }},target=/root/.
 # and the generator falls back to canonical SPDX text. cargo's registry lives
 # under CARGO_HOME and/or the cache-mounted /root/.cargo — scan both.
 RUN --mount=type=cache,target=/root/.cargo/registry,sharing=shared \
+    --mount=type=cache,target=/root/.cargo/git,sharing=shared \
     for src in "${CARGO_HOME}/registry/src" /root/.cargo/registry/src; do \
         [ -d "$src" ] || continue; \
         find "$src" -mindepth 2 -maxdepth 2 -type d | while IFS= read -r crate; do \
@@ -688,6 +692,23 @@ RUN --mount=type=cache,target=/root/.cargo/registry,sharing=shared \
             for lf in "$crate"/LICENSE* "$crate"/LICENCE* "$crate"/COPYING* "$crate"/NOTICE* "$crate"/UNLICENSE*; do \
                 [ -e "$lf" ] || continue; \
                 mkdir -p "$dest" && cp "$lf" "$dest/" 2>/dev/null || true; \
+            done; \
+        done; \
+    done; \
+    # Fork validation uses an immutable git dependency until publication.
+    # Preserve its attribution and bundled JPEG notices just like registry crates.
+    for src in "${CARGO_HOME}/git/checkouts" /root/.cargo/git/checkouts; do \
+        [ -d "$src" ] || continue; \
+        find "$src" -path '*/multimodal/Cargo.toml' -type f | while IFS= read -r manifest; do \
+            grep -qx 'name = "dynamo-multimodal"' "$manifest" || continue; \
+            crate=$(dirname "$manifest"); \
+            version=$(sed -n 's/^version = "\([^"]*\)"/\1/p' "$manifest"); \
+            [ -n "$version" ] || continue; \
+            dest="/opt/dynamo/rust-licenses/dynamo-multimodal-$version"; \
+            mkdir -p "$dest"; \
+            for lf in "$crate"/LICENSE* "$crate"/NOTICE*; do \
+                [ -f "$lf" ] || continue; \
+                cp "$lf" "$dest/"; \
             done; \
         done; \
     done; \

@@ -50,6 +50,7 @@ ARG CARGO_BUILD_JOBS
 ARG NATS_VERSION={{ context.dynamo.nats_version }}
 ARG ETCD_VERSION={{ context.dynamo.etcd_version }}
 
+ARG ENABLE_SHARED_MEDIA=false
 ARG ENABLE_MEDIA_FFMPEG={{ context[framework].enable_media_ffmpeg }}
 ARG FFMPEG_VERSION={{ context.dynamo.ffmpeg_version }}
 ARG LIBVPX_REF={{ context.dynamo.libvpx_ref }}

@@ -191,13 +191,19 @@ def test_bundle_wheel_notices_injects_and_keeps_record_valid(tmp_path):
     whl = tmp_path / "foo-1.0-py3-none-any.whl"
     _make_wheel(whl, di, {f"{di}/sboms/foo.cyclonedx.json": json.dumps(sbom).encode()})
 
-    assert bundle_wheel_notices.process(whl, None) == 0
+    licenses = tmp_path / "licenses"
+    package = licenses / "serde-1.0.0"
+    package.mkdir(parents=True)
+    (package / "LICENSE").write_text("Package license text: MIT")
+    (package / "NOTICE-native").write_text("Required native dependency attribution")
+    assert bundle_wheel_notices.process(whl, licenses) == 0
 
     arc = f"{di}/licenses/THIRD-PARTY-RUST-LICENSES.txt"
     with zipfile.ZipFile(whl) as z:
         assert arc in z.namelist()
         data = z.read(arc)
         assert b"serde" in data and b"MIT" in data
+        assert b"Required native dependency attribution" in data
         want = "sha256=" + base64.urlsafe_b64encode(
             hashlib.sha256(data).digest()
         ).decode().rstrip("=")

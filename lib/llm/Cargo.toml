@@ -27,7 +27,9 @@ nccl = ["dep:cudarc", "cudarc/nccl"]  # Enable NCCL collective operations
 block-manager-bench = ["block-manager", "testing-full", "dep:clap", "dep:indicatif"]
 cuda = ["dep:cudarc"]
 integration = ["dynamo-runtime/integration"]
-media-ffmpeg = ["dep:video-rs", "dep:ffmpeg-next", "dep:memfile"]
+media-ffmpeg = ["dep:video-rs", "dep:ffmpeg-next", "dep:memfile", "dynamo-multimodal?/video"]
+# Fork validation only; default stays on the original decoder until publication.
+shared-media = ["dep:dynamo-multimodal"]
 bench = ["dynamo-kv-router/bench"]
 # Pull-only CKF Relay stats and snapshots. Keep this separate from `metrics`, which
 # is enabled by normal `dynamo-llm` builds and must not retain diagnostic hot-path work.
@@ -201,6 +203,9 @@ bs62 = { version = "0.1" }
 # dynamo-renderer; minijinja's map is the remaining sort point.
 minijinja = { version = "2.21.0", features = ["loader", "loop_controls", "preserve_order"] }
 json-five = { version = "0.3" }
+
+# Fork integration; replace the fork revision with a released version before upstream rollout.
+dynamo-multimodal = { git = "https://github.com/HanFa/frontend-crates.git", rev = "984199d41cfbf56e4083707a386501344a2b7f0c", version = "0.1.0", default-features = false, features = ["media-decode"], optional = true }
 
 # media loading in the preprocessor
 reqwest = { workspace = true }
