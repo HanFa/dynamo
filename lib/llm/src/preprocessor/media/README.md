@@ -260,3 +260,70 @@ wheels, and `test_router_rust_mm_frontend_decode_e2e.py` on supported GPU
 backends with real NIXL registration and cleanup. Registry publication and
 consumption of that released crate also remain pending. The fork deliberately
 retains the original implementation until those rollout steps are complete.
+
+### Concurrent decode comparison
+
+Measured on an AMD Ryzen 9 7900X (12 cores / 24 logical CPUs), Linux
+6.14.0-37-generic, using the native versions above and the existing Criterion
+0.5.1 image/video benchmarks. The original decoder is the retained legacy
+path with `shared-media` disabled. The shared path is the implementation in
+`2b73f6faf09895add819096a666b7233dd5a8e78`, pinned to the shared crate
+revision above. Both use the optimized bench profile (optimization level 3,
+one codegen unit, thin LTO). All migration compilation finished before timing.
+
+The image workload is a batch of 100 generated 3840x2160 JPEGs, tested with
+both ImageReader and system TurboJPEG at 1/8/32 Rayon threads. The video
+workload samples 30 frames from `240p_100.mp4` (VP9, 320x240), with one video
+per concurrent thread. Encoded-input cloning is outside the timed section in
+both existing harnesses. This measures synchronous decoding and output storage
+construction, not request fetching, async queueing, hashing or NIXL transfer.
+
+Each case uses 10 samples, a one-second warmup and a three-second target
+measurement time; Criterion increases that time when ten batches require
+longer. The original sweep ran before the shared sweep on the same workstation,
+without CPU affinity or exclusive host reservation. Treat the numbers as a
+local regression check, not production capacity or request p95/p99 latency.
+
+Reproduce with the existing harnesses and the same native library paths:
+
+```bash
+export RUN_IMAGE_DECODE_SWEEP=1 RUN_VIDEO_DECODE_SWEEP=1
+export DYNAMO_REQUIRE_LIBJPEG_TURBO_TEST=1
+for variant in original shared; do
+  features=media-ffmpeg
+  if [ "$variant" = shared ]; then features=shared-media,media-ffmpeg; fi
+  cargo +1.96.1 bench -p dynamo-llm --no-default-features --locked \
+    --features "$features" --bench image_decode --bench video_decode -- \
+    'batch_100|video_decode_concurrent' --warm-up-time 1 \
+    --measurement-time 3 --sample-size 10 --save-baseline "$variant"
+done
+```
+
+For the recorded run, both executable variants were built first and then run
+directly with those Criterion options, so compilation did not overlap timing.
+
+Mean batch latency and decoded items per second (images or videos):
+
+| Decoder | Threads | Batch size | Original ms | Shared ms | Latency change | Original items/s | Shared items/s |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| JPEG ImageReader | 1 | 100 | 8935.71 | 9157.98 | +2.5% | 11.19 | 10.92 |
+| JPEG ImageReader | 8 | 100 | 1359.18 | 1369.14 | +0.7% | 73.57 | 73.04 |
+| JPEG ImageReader | 32 | 100 | 879.02 | 888.31 | +1.1% | 113.76 | 112.57 |
+| JPEG TurboJPEG | 1 | 100 | 8035.25 | 7747.92 | -3.6% | 12.45 | 12.91 |
+| JPEG TurboJPEG | 8 | 100 | 1167.24 | 1158.44 | -0.8% | 85.67 | 86.32 |
+| JPEG TurboJPEG | 32 | 100 | 683.02 | 684.87 | +0.3% | 146.41 | 146.01 |
+| VP9 FFmpeg | 1 | 1 | 66.47 | 65.45 | -1.5% | 15.04 | 15.28 |
+| VP9 FFmpeg | 8 | 8 | 75.25 | 76.05 | +1.1% | 106.31 | 105.20 |
+| VP9 FFmpeg | 32 | 32 | 162.48 | 162.65 | +0.1% | 196.94 | 196.75 |
+
+The largest observed regression is +2.5% latency for serial ImageReader,
+with throughput decreasing from 11.19 to 10.92 images/s. The 8/32-thread
+cases show changes between -0.8% and +1.1%. These measurements do not establish
+the cause of small differences on a shared host; repeat on the deployment
+hardware before deciding a performance acceptance threshold. No speedup is
+required or claimed for this extraction.
+
+The [comparison CSV](../../../benches/shared_media_comparison.csv) contains
+unrounded means, 95% confidence intervals, deltas and throughput. The
+[Criterion samples and estimates](../../../benches/shared_media_samples.json)
+retain all ten measurements per case for both implementations.
